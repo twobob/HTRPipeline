@@ -10,6 +10,7 @@ operations:
 
 ## Installation
 
+* You need [git-lfs](https://git-lfs.com/) installed so that model weights get downloaded when cloning the repository
 * Go to the root level of the repository
 * Execute `pip install .`
 
