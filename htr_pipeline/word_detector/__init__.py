@@ -1,113 +1,75 @@
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List
 
 import cv2
 import numpy as np
+import onnxruntime as ort
+from path import Path
 from sklearn.cluster import DBSCAN
 
+from .aabb import AABB
+from .aabb_clustering import cluster_aabbs
+from .coding import decode, fg_by_cc, fg_by_threshold
+from .iou import compute_iou
 
-@dataclass
-class BBox:
-    x: int
-    y: int
-    w: int
-    h: int
 
-    def __mul__(self, f: float):
-        x = int(self.x * f)
-        y = int(self.y * f)
-        w = int(self.w * f)
-        h = int(self.h * f)
-        return BBox(x, y, w, h)
+def _load_model():
+    """Loads model and model metadata."""
+    file_path = Path(__file__).abspath().dirname() / 'stored_model'
+    ort_session = ort.InferenceSession(file_path / 'model.onnx',
+                                       providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+
+    return ort_session
+
+
+# global vars holding the model and model metadata
+_ORT_SESSION = _load_model()
 
 
 @dataclass
 class DetectorRes:
     img: np.ndarray
-    bbox: BBox
+    aabb: AABB
 
 
-def detect(img: np.ndarray,
-           kernel_size: int,
-           sigma: float,
-           theta: float,
-           min_area: int) -> List[DetectorRes]:
-    """Scale space technique for word segmentation proposed by R. Manmatha.
+def ceil32(val):
+    if val % 32 == 0:
+        return val
+    val = (val // 32 + 1) * 32
+    return val
 
-    For details see paper http://ciir.cs.umass.edu/pubfiles/mm-27.pdf.
 
-    Args:
-        img: A grayscale uint8 image.
-        kernel_size: The size of the filter kernel, must be an odd integer.
-        sigma: Standard deviation of Gaussian function used for filter kernel.
-        theta: Approximated width/height ratio of words, filter function is distorted by this factor.
-        min_area: Ignore word candidates smaller than specified area.
-
-    Returns:
-        List of DetectorRes instances, each containing the bounding box and the word image.
-    """
-    assert img.ndim == 2
-    assert img.dtype == np.uint8
-
-    # apply filter kernel
-    kernel = _compute_kernel(kernel_size, sigma, theta)
-    img_filtered = cv2.filter2D(img, -1, kernel, borderType=cv2.BORDER_REPLICATE).astype(np.uint8)
-    img_thres = 255 - cv2.threshold(img_filtered, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-
-    # append components to result
-    res = []
-    components = cv2.findContours(img_thres, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)[0]
-    for c in components:
-        # skip small word candidates
-        if cv2.contourArea(c) < min_area:
-            continue
-        # append bounding box and image of word to result list
-        x, y, w, h = cv2.boundingRect(c)  # bounding box as tuple (x, y, w, h)
-        crop = img[y:y + h, x:x + w]
-        res.append(DetectorRes(crop, BBox(x, y, w, h)))
-
+def pad_image(img):
+    res = 255 * np.ones([ceil32(img.shape[0]), ceil32(img.shape[1])])
+    res[:img.shape[0], :img.shape[1]] = img
     return res
 
 
-def _compute_kernel(kernel_size: int,
-                    sigma: float,
-                    theta: float) -> np.ndarray:
-    """Compute anisotropic filter kernel."""
+def detect(img: np.ndarray, height: int, enlarge: int) -> List[DetectorRes]:
+    f = height / img.shape[0]
+    img_resized = cv2.resize(img, None, fx=f, fy=f)
+    img_padded = pad_image(img_resized)
+    img_batch = img_padded.astype(np.float32)[None, None] / 255 - 0.5
 
-    assert kernel_size % 2  # must be odd size
+    outputs = _ORT_SESSION.run(None, {'input': img_batch})
+    pred_map = outputs[0][0]
+    aabbs = decode(pred_map, comp_fg=fg_by_cc(0.5, 100), f=img_batch.shape[2] / pred_map.shape[1])
+    aabbs = [aabb.scale(1 / f, 1 / f) for aabb in aabbs if aabb.scale(1 / f, 1 / f)]
+    h, w = img.shape
+    aabbs = [aabb.clip(AABB(0, w - 1, 0, h - 1)) for aabb in aabbs]  # bounding box must be inside img
+    clustered_aabbs = cluster_aabbs(aabbs)
 
-    # create coordinate grid
-    half_size = kernel_size // 2
-    xs = ys = np.linspace(-half_size, half_size, kernel_size)
-    x, y = np.meshgrid(xs, ys)
+    res = []
+    for aabb in clustered_aabbs:
+        aabb = aabb.enlarge(enlarge)
+        aabb = aabb.as_type(int).clip(AABB(0, img.shape[1], 0, img.shape[0]))
+        if aabb.area() == 0:
+            continue
+        crop = img[aabb.ymin:aabb.ymax, aabb.xmin:aabb.xmax]
+        res.append(DetectorRes(crop, aabb))
 
-    # compute sigma values in x and y direction, where theta is roughly the average x/y ratio of words
-    sigma_y = sigma
-    sigma_x = sigma_y * theta
-
-    # compute terms and combine them
-    exp_term = np.exp(-x ** 2 / (2 * sigma_x) - y ** 2 / (2 * sigma_y))
-    x_term = (x ** 2 - sigma_x ** 2) / (2 * np.math.pi * sigma_x ** 5 * sigma_y)
-    y_term = (y ** 2 - sigma_y ** 2) / (2 * np.math.pi * sigma_y ** 5 * sigma_x)
-    kernel = (x_term + y_term) * exp_term
-
-    # normalize and return kernel
-    kernel = kernel / np.sum(kernel)
-    return kernel
-
-
-def prepare_img(img: np.ndarray,
-                height: int) -> Tuple[np.ndarray, float]:
-    """Convert image to grayscale image (if needed) and resize to given height."""
-    assert img.ndim in (2, 3)
-    assert height > 0
-    assert img.dtype == np.uint8
-    if img.ndim == 3:
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    h = img.shape[0]
-    factor = height / h
-    return cv2.resize(img, dsize=None, fx=factor, fy=factor), factor
+    return res
 
 
 def _cluster_lines(detections: List[DetectorRes],
@@ -118,12 +80,12 @@ def _cluster_lines(detections: List[DetectorRes],
     dist_mat = np.ones((num_bboxes, num_bboxes))
     for i in range(num_bboxes):
         for j in range(i, num_bboxes):
-            a = detections[i].bbox
-            b = detections[j].bbox
-            if a.y > b.y + b.h or b.y > a.y + a.h:
+            a = detections[i].aabb
+            b = detections[j].aabb
+            if a.ymin > b.ymax or b.ymin > a.ymax:
                 continue
-            intersection = min(a.y + a.h, b.y + b.h) - max(a.y, b.y)
-            union = a.h + b.h - intersection
+            intersection = min(a.ymax, b.ymax) - max(a.ymin, b.ymin)
+            union = a.height + b.height - intersection
             iou = np.clip(intersection / union if union > 0 else 0, 0, 1)
             dist_mat[i, j] = dist_mat[j, i] = 1 - iou  # Jaccard distance is defined as 1-iou
 
@@ -135,7 +97,7 @@ def _cluster_lines(detections: List[DetectorRes],
             continue
         clustered[cluster_id].append(detections[i])
 
-    res = sorted(clustered.values(), key=lambda line: [det.bbox.y + det.bbox.h / 2 for det in line])
+    res = sorted(clustered.values(), key=lambda line: [det.aabb.ymin + det.aabb.height / 2 for det in line])
     return res
 
 
@@ -161,4 +123,4 @@ def sort_multiline(detections: List[DetectorRes],
 
 def sort_line(detections: List[DetectorRes]) -> List[List[DetectorRes]]:
     """Sort the list of detections according to x-coordinates of word centers."""
-    return [sorted(detections, key=lambda det: det.bbox.x + det.bbox.w / 2)]
+    return [sorted(detections, key=lambda det: det.aabb.xmin + det.aabb.width / 2)]

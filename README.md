@@ -8,13 +8,6 @@ operations:
 
 ![example](./doc/example.png)
 
-The pipeline combines these two models:
-
-* [Scale space based word detector](https://github.com/githubharald/WordDetector)
-* [CRNN based text reader](https://github.com/githubharald/SimpleHTR)
-
-**Don't expect too much as these are both very rudimentary models.**
-
 ## Installation
 
 * Go to the root level of the repository
@@ -29,34 +22,46 @@ The pipeline combines these two models:
 * Run `python demo.py`
 * The output should look like the plot shown above
 
+### Run web demo (gradio)
+
+* Additionally install gradio: `pip install gradio`
+* Go to the root directory of the repository
+* Run `python scripts/gradio_demo.py`
+* Open the URL shown in the output
+
+![example](./doc/gradio.png)
+
 ### Use Python package
 
 Import the function `read_page` to detect and read text.
 
 ````python
 import cv2
-from htr_pipeline import read_page, DetectorConfig
+from htr_pipeline import read_page, DetectorConfig, LineClusteringConfig
 
 # read image
-img = cv2.imread('data/r06-137.png', cv2.IMREAD_GRAYSCALE)
+img = cv2.imread('data/sample_1.png', cv2.IMREAD_GRAYSCALE)
 
 # detect and read text
-read_lines = read_page(img, DetectorConfig(height=1000))
+read_lines = read_page(img, 
+                       DetectorConfig(height=200, enlarge=5), 
+                       line_clustering_config=LineClusteringConfig(min_words_per_line=2))
 
 # output text
 for read_line in read_lines:
     print(' '.join(read_word.text for read_word in read_line))
 ````
 
+
 If needed, the detection can be configured by instantiating and passing these data-classes:
 
-* `DetectorConfig`
+* `DetectorConfig`: height should be roughly 50px per text-line
 * `LineClusteringConfig`
+* `ReaderConfig`
 
-For more details please have a look at the docstrings of `detect` and `sort_multiline`
-in `htr_pipeline/word_detector/__init__.py`. The most important settings are:
 
-* `height` in `DetectorConfig`: the word detector is not scale invariant, the text height should be 25-50px when using
-  the default parameters, which is achieved by resizing the image to the specified height
-* `min_words_per_line` in `LineClusteringConfig`: lines which have fewer words than specified are discarded, the default
-  setting is 2, which means that lines with a single word will not be read by default
+## Future work
+* Better documentation of all the features (e.g., how to use a dictionary) - for now please have a look into the demo scripts to learn about the features of this package
+* Add special characters like ".", "?", ...
+* Optionally, read the whole line instead of single words
+* Improve inference speed

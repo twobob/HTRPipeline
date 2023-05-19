@@ -1,45 +1,53 @@
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
+import cv2
 import numpy as np
 
 from .reader import read
-from .word_detector import detect, sort_multiline, prepare_img, BBox
+from .reader.ctc import PrefixTree
+from .word_detector import detect, sort_multiline, AABB
 
 
 @dataclass
 class WordReadout:
+    """Information about a read word: the readout and the bounding box."""
     text: str
-    bbox: BBox
+    aabb: AABB
 
 
 @dataclass
 class DetectorConfig:
+    """Configure at which image size the detection takes place,
+    and how much the detection bounding box will be enlarged before reading it."""
     height: int = 1000  # input image is resized to this height for detection algo
-    kernel_size: int = 25
-    sigma: float = 11
-    theta: float = 7
-    min_area: int = 100
+    enlarge: int = 5
 
 
 @dataclass
 class LineClusteringConfig:
-    min_words_per_line: int = 2  # minimum number of words per line, if less, line gets discarded
+    """Configure how word detections are clustered into lines."""
+    min_words_per_line: int = 1  # minimum number of words per line, if less, line gets discarded
     max_dist: float = 0.7  # threshold for clustering words into lines, value between 0 and 1
 
 
+@dataclass
+class ReaderConfig:
+    """Configure how the detected words are read."""
+    decoder: str = 'best_path'  # 'best_path' or 'word_beam_search'
+    prefix_tree: Optional[PrefixTree] = None
+
+
 def read_page(img: np.ndarray,
-              detector_config: DetectorConfig = DetectorConfig(1000),
-              line_clustering_config=LineClusteringConfig()) -> List[List[WordReadout]]:
-    # prepare image
-    img, f = prepare_img(img, detector_config.height)
+              detector_config: DetectorConfig = DetectorConfig(),
+              line_clustering_config=LineClusteringConfig(),
+              reader_config=ReaderConfig()) -> List[List[WordReadout]]:
+    """Read a page of handwritten words. Returns a list of lines. Each line is a list of read words."""
+    if img.ndim == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
 
     # detect words
-    detections = detect(img,
-                        detector_config.kernel_size,
-                        detector_config.sigma,
-                        detector_config.theta,
-                        detector_config.min_area)
+    detections = detect(img, detector_config.height, detector_config.enlarge)
 
     # sort words (cluster into lines and ensure reading order top->bottom and left->right)
     lines = sort_multiline(detections, min_words_per_line=line_clustering_config.min_words_per_line)
@@ -49,7 +57,7 @@ def read_page(img: np.ndarray,
     for line in lines:
         read_lines.append([])
         for word in line:
-            text = read(word.img)
-            read_lines[-1].append(WordReadout(text, word.bbox * (1 / f)))
+            text = read(word.img, reader_config.decoder, reader_config.prefix_tree)
+            read_lines[-1].append(WordReadout(text, word.aabb))
 
     return read_lines

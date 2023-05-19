@@ -2,17 +2,18 @@ from setuptools import setup, find_namespace_packages
 
 setup(
     name='htr-pipeline',
-    version='1.0.0',
+    version='1.1.0',
     description='Handwritten text recognition pipeline.',
     author='Harald Scheidl',
     packages=find_namespace_packages(),
     url="https://github.com/githubharald/HTRPipeline",
-    install_requires=['numpy==1.21.0',
-                      'tensorflow==2.11.0',
+    install_requires=['numpy',
+                      'onnxruntime',
                       'opencv-python',
                       'scikit-learn',
                       'editdistance',
                       'path'],
     python_requires='>=3.8',
-    package_data={'htr_pipeline.reader.stored_model': ['*']}
+    package_data={'htr_pipeline.reader.stored_model': ['*'],
+                  'htr_pipeline.word_detector.stored_model': ['*']}
 )
